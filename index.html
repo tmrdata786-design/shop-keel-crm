@@ -999,7 +999,10 @@ function unwrapWrite(resp, opts) {
   const o = opts || {};
   const label = o.label || o.action || 'write request';
   if (resp === null || resp === undefined) {
-    throw new Error('No response from Manager.io for the ' + label + ' — the request did not complete.');
+    if (o.requireKey) {
+      throw new Error('No response from Manager.io for the ' + label + ' — the request did not complete.');
+    }
+    return {};
   }
   const errText = managerErrorText(resp);
   if (errText) {
