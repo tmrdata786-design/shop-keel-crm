@@ -1147,7 +1147,8 @@ const FIELD_CANDIDATES = {
   crm_notes: ['crm notes', 'lead notes', 'notes'],
   master_reference: ['master reference', 'master_reference'],
   crm_workflow: ['crm'],
-  production_state: ['production state', 'production stages', 'production_state']
+  production_state: ['production state', 'production stages', 'production_state'],
+  production_status: ['production status', 'production_status']
 };
 
 const FIELD_PLACEMENT = {
@@ -1159,7 +1160,8 @@ const FIELD_PLACEMENT = {
   crm_probability: 'Sales Quote',
   crm_workflow: 'Sales Quote',
   master_reference: 'Sales Order',
-  production_state: 'Sales Order'
+  production_state: 'Sales Order',
+  production_status: 'Sales Order'
 };
 
 let fieldMapWarned = false;
@@ -3304,6 +3306,7 @@ async function openOrderViewDrawer(key) {
   }
   const row = App.orders.find((r) => (r.key || r.Key) === key) || {};
   const master = getCF(form, 'master_reference');
+  const prodStatus = getCF(form, 'production_status');
   const quoteKey = lineItemKey(form.SalesQuote);
   const rowHtml = (label, value) => '<div class="flex items-center justify-between gap-3 py-1.5"><span class="shrink-0 text-[11.5px] sec">' + escapeHtml(label) + '</span><span class="truncate text-right text-sm t">' + value + '</span></div>';
   const body = '<div class="space-y-4">'
@@ -3313,6 +3316,7 @@ async function openOrderViewDrawer(key) {
     + rowHtml('Customer', escapeHtml(customerLabel(orderCustomerKey(form)) || row.customer || '—'))
     + rowHtml('Order Amount', fmtOrderAmount(row.orderAmount))
     + rowHtml('Master Reference', master ? '<span class="text-xs accent">' + escapeHtml(master) + '</span>' : '—')
+    + (prodStatus ? rowHtml('Production Status', '<span class="text-xs accent">' + escapeHtml(prodStatus) + '</span>') : '')
     + rowHtml('Invoice Status', escapeHtml(row.invoiceStatus || '—'))
     + rowHtml('Delivery Status', escapeHtml(row.deliveryStatus || '—'))
     + '</div>'
@@ -3505,6 +3509,20 @@ function serializeProductionState(state) {
     history: Array.isArray(state.history) ? state.history : [],
     updatedAt: state.updatedAt || new Date().toISOString()
   });
+}
+
+function productionStatusLabel(state) {
+  if (!state || state.parseError) return 'Unknown';
+  const stage = String(state.currentStage || '');
+  if (stage === 'Completed') return 'Completed';
+  if (state.designQueue) return 'Design Review';
+  const sub = String(state.currentSubStage || '');
+  if (!stage) {
+    const last = Array.isArray(state.history) && state.history.length ? state.history[state.history.length - 1] : null;
+    const lastStage = String((last && last.stage) || '');
+    return lastStage || 'Unknown';
+  }
+  return sub ? stage + ' — ' + sub : stage;
 }
 
 function productionIsStarted(state) {
@@ -3871,7 +3889,9 @@ async function openProductionDrawer(key) {
 async function persistProductionState(orderKey, state, prevRaw, actionName, detail) {
   const form = App.orderForms[orderKey];
   if (!form) return false;
+  const prevStatus = getCF(form, 'production_status');
   setCF(form, 'production_state', serializeProductionState(state));
+  setCF(form, 'production_status', productionStatusLabel(state));
   const orderFormPath = apiPath('/sales-order-form/') + orderKey;
   try {
     await unwrapWrite(await postMessageWithResponse({ type: 'api-request', method: 'PUT', path: orderFormPath, body: form }),
@@ -3888,6 +3908,7 @@ async function persistProductionState(orderKey, state, prevRaw, actionName, deta
   } catch (err) {
     console.error('[KEEL] persistProductionState failed', err);
     setCF(form, 'production_state', prevRaw);
+    setCF(form, 'production_status', prevStatus);
     App.orderForms[orderKey] = form;
     App.productionState[orderKey] = parseProductionState(form, orderKey);
     logSync({
