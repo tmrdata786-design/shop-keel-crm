@@ -544,7 +544,7 @@
         <div class="mb-6 flex flex-wrap items-end justify-between gap-3">
           <div>
             <h1 class="text-[15px] font-medium muted">Sync Center</h1>
-            <p class="text-sm muted">Failed gateway operations — inspect payloads and retry where safe.</p>
+            <p class="text-sm muted">Failed gateway operations — inspect payloads, retry where safe, and run bridge diagnostics.</p>
           </div>
           <button type="button" data-action="sync-refresh"
             class="rounded-[4px] border line px-4 py-2 text-sm t transition btnhov">Refresh</button>
@@ -820,7 +820,9 @@ const App = {
   auditLog: [],
   syncLog: [],
   auditState: { filter: 'all' },
-  catalogState: { search: '' }
+  catalogState: { search: '' },
+  syncTab: 'failures',
+  syncDiag: { results: {} }
 };
 
 const VIEW_TITLES = {
@@ -957,6 +959,11 @@ function readHashView() {
 }
 
 /* ═══ 3. MANAGER.IO API BRIDGE ═══ */
+/* The live Manager.io API is versioned /api2 — see Sync ▸ Diagnostics for the empirical proof.
+   Every request in this file must build paths through apiPath()/API_PREFIX, never a hardcoded prefix. */
+const API_PREFIX = '/api2';
+function apiPath(p) { return API_PREFIX + p; }
+
 function postMessageWithResponse(message) {
   return new Promise((resolve, reject) => {
     const requestId = crypto.randomUUID();
@@ -976,6 +983,51 @@ function postMessageWithResponse(message) {
   });
 }
 
+/* ═══ 3B. RESPONSE VALIDATION — never show a false success ═══ */
+function managerErrorText(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
+  const parts = [];
+  if (body.error) parts.push(typeof body.error === 'string' ? body.error : JSON.stringify(body.error));
+  if (body.message) parts.push(String(body.message));
+  if (Array.isArray(body.errors) && body.errors.length) {
+    body.errors.forEach((e) => parts.push(typeof e === 'string' ? e : JSON.stringify(e)));
+  }
+  return parts.length ? parts.join('; ') : null;
+}
+
+function unwrapWrite(resp, opts) {
+  const o = opts || {};
+  const label = o.label || o.action || 'write request';
+  if (resp === null || resp === undefined) {
+    throw new Error('No response from Manager.io for the ' + label + ' — the request did not complete.');
+  }
+  const errText = managerErrorText(resp);
+  if (errText) {
+    if (o.path && /no endpoint matches|not_found|404/i.test(errText)) {
+      throw new Error('Manager.io rejected this request (no such endpoint: ' + o.path + '). Run Sync ▸ Diagnostics to confirm the API prefix.');
+    }
+    throw new Error('Manager rejected the request: ' + errText);
+  }
+  if (o.requireKey) {
+    const key = resp && (resp.Key || resp.key || resp.id || resp.Id);
+    if (!key) {
+      throw new Error('Manager accepted the ' + label + ' but did not return a record Key — treat it as not saved.');
+    }
+  }
+  return resp;
+}
+
+function unwrapRead(resp, label) {
+  const errText = managerErrorText(resp);
+  if (errText) throw new Error('Manager error (' + (label || 'read') + '): ' + errText);
+  return resp;
+}
+
+async function getManagerRecord(path, label) {
+  const body = await postMessageWithResponse({ type: 'api-request', method: 'GET', path: path });
+  return unwrapRead(body, label || ('GET ' + path));
+}
+
 /* ═══ 4. PAGINATION FETCHER ═══ */
 async function fetchManagerData(endpoint) {
   const allItems = [];
@@ -988,6 +1040,7 @@ async function fetchManagerData(endpoint) {
       : `${endpoint}?PageSize=99999`;
 
     const data = await postMessageWithResponse({ type: 'api-request', method: 'GET', path });
+    unwrapRead(data, 'GET ' + path);
     const page = Array.isArray(data) ? data : (data.items || data.data || []);
 
     allItems.push(...page);
@@ -1130,11 +1183,11 @@ async function loadCustomFieldMap() {
   if (App.fieldMapLoaded) return App.fieldMap;
   try {
     const results = await Promise.all([
-      fetchManagerData('/api4/text-custom-fields').catch((err) => {
+      fetchManagerData(apiPath('/text-custom-fields')).catch((err) => {
         console.error('[KEEL] text-custom-fields fetch failed', err);
         return null;
       }),
-      fetchManagerData('/api4/number-custom-fields').catch((err) => {
+      fetchManagerData(apiPath('/number-custom-fields')).catch((err) => {
         console.error('[KEEL] number-custom-fields fetch failed', err);
         return null;
       })
@@ -1516,7 +1569,7 @@ function once(name, fn) {
 }
 
 async function loadCustomers() {
-  App.customers = await fetchManagerData('/api4/customer');
+  App.customers = await fetchManagerData(apiPath('/customer'));
   return App.customers;
 }
 
@@ -1527,7 +1580,7 @@ async function hydrateCustomerForms() {
   });
   const results = await mapWithConcurrency(missing, 6, async (row) => {
     const key = row.key || row.Key;
-    const rec = await postMessageWithResponse({ type: 'api-request', method: 'GET', path: '/api4/customer-form/' + key });
+    const rec = await getManagerRecord(apiPath('/customer-form/') + key, 'customer form');
     App.customerForms[key] = rec;
   });
   surfaceHydrationFailures(results, 'customer');
@@ -1546,7 +1599,7 @@ function surfaceHydrationFailures(results, label) {
 }
 
 async function loadQuotes() {
-  App.quotesRaw = await fetchManagerData('/api4/sales-quote');
+  App.quotesRaw = await fetchManagerData(apiPath('/sales-quote'));
   return App.quotesRaw;
 }
 
@@ -1557,7 +1610,7 @@ async function hydrateQuotes() {
   });
   const results = await mapWithConcurrency(missing, 6, async (row) => {
     const key = row.key || row.Key;
-    const rec = await postMessageWithResponse({ type: 'api-request', method: 'GET', path: '/api4/sales-quote-form/' + key });
+    const rec = await getManagerRecord(apiPath('/sales-quote-form/') + key, 'quote form');
     App.quoteForms[key] = rec;
   });
   surfaceHydrationFailures(results, 'quote');
@@ -1575,22 +1628,24 @@ async function loadQuoteData() {
 }
 
 async function loadOrders() {
+  const listPath = apiPath('/sales-orders');
+  const altPath = apiPath('/sales-order');
   let rows = [];
   let primaryFailed = null;
   try {
-    rows = await fetchManagerData('/api4/sales-orders');
+    rows = await fetchManagerData(listPath);
   } catch (err) {
     primaryFailed = err;
-    console.error('[KEEL] loadOrders /api4/sales-orders failed', err);
+    console.error('[KEEL] loadOrders ' + listPath + ' failed', err);
   }
   let altOk = false;
   if (!rows.length) {
     try {
-      const alt = await fetchManagerData('/api4/sales-order');
+      const alt = await fetchManagerData(altPath);
       altOk = true;
       if (alt.length) rows = alt;
     } catch (err) {
-      console.error('[KEEL] loadOrders /api4/sales-order failed', err);
+      console.error('[KEEL] loadOrders ' + altPath + ' failed', err);
     }
   }
   if (!rows.length && primaryFailed && !altOk) throw primaryFailed;
@@ -1605,7 +1660,7 @@ async function hydrateOrders() {
   });
   const results = await mapWithConcurrency(missing, 6, async (row) => {
     const key = row.key || row.Key;
-    const rec = await postMessageWithResponse({ type: 'api-request', method: 'GET', path: '/api4/sales-order-form/' + key });
+    const rec = await getManagerRecord(apiPath('/sales-order-form/') + key, 'sales order form');
     App.orderForms[key] = rec;
   });
   surfaceHydrationFailures(results, 'sales order');
@@ -1745,7 +1800,7 @@ async function openPersonDrawer(mode, key) {
     rec = customerForm(key);
     if (!rec) {
       try {
-        rec = await postMessageWithResponse({ type: 'api-request', method: 'GET', path: '/api4/customer-form/' + key });
+        rec = await getManagerRecord(apiPath('/customer-form/') + key, 'customer form');
         App.customerForms[key] = rec;
       } catch (err) {
         console.error('[KEEL] openPersonDrawer load failed', err);
@@ -1792,9 +1847,10 @@ async function savePersonForm(mode, key, form, btn) {
   setLoading(btn);
   try {
     let rec;
+    const savePath = key ? apiPath('/customer-form/') + key : apiPath('/customer-form');
     if (key) {
       rec = customerForm(key);
-      if (!rec) rec = await postMessageWithResponse({ type: 'api-request', method: 'GET', path: '/api4/customer-form/' + key });
+      if (!rec) rec = await getManagerRecord(savePath, 'customer form');
     } else {
       rec = { Name: name, Code: code, CustomFields2: emptyCF() };
       if (mode === 'lead' && hasCF('lead_status')) setCF(rec, 'lead_status', 'New');
@@ -1807,15 +1863,16 @@ async function savePersonForm(mode, key, form, btn) {
     }
     if (hasCF('crm_notes')) setCF(rec, 'crm_notes', notes);
 
-    const saved = await postMessageWithResponse({
+    const saved = unwrapWrite(await postMessageWithResponse({
       type: 'api-request',
       method: key ? 'PUT' : 'POST',
-      path: key ? '/api4/customer-form/' + key : '/api4/customer-form',
+      path: savePath,
       body: rec
-    });
+    }), { label: (key ? 'update ' : 'create ') + (mode === 'lead' ? 'lead' : 'customer record'), path: savePath, requireKey: !key });
     const savedKey = (saved && (saved.Key || saved.key)) || key;
     if (savedKey) {
       rec.Key = savedKey;
+      if (saved && saved.NameWithCode) rec.NameWithCode = saved.NameWithCode;
       App.customerForms[savedKey] = rec;
     }
     logSync({ ok: true, entity: 'Customer', action: key ? 'Update' : 'Create', error: null });
@@ -1830,7 +1887,7 @@ async function savePersonForm(mode, key, form, btn) {
     logSync({
       ok: false, entity: 'Customer', action: key ? 'Update' : 'Create',
       error: String(err && err.message || err), payload: { name: name, key: key || null },
-      req: { method: key ? 'PUT' : 'POST', path: key ? '/api4/customer-form/' + key : '/api4/customer-form', body: rec },
+      req: { method: key ? 'PUT' : 'POST', path: key ? apiPath('/customer-form/') + key : apiPath('/customer-form'), body: rec },
       retrySafe: !!key
     });
     showToast('Save failed: ' + (err && err.message || err), 'error');
@@ -1842,41 +1899,45 @@ async function convertLead(key, btn) {
   if (!requireCap('manage_leads_customers', 'Convert Lead')) return;
   const prevBtnHtml = btn ? btn.innerHTML : '';
   if (btn) setLoading(btn);
+  const customerFormPath = apiPath('/customer-form/') + key;
   let fullRec;
   let prevStatus = '';
   try {
     fullRec = customerForm(key);
     if (!fullRec) {
-      fullRec = await postMessageWithResponse({ type: 'api-request', method: 'GET', path: '/api4/customer-form/' + key });
+      fullRec = await getManagerRecord(customerFormPath, 'customer form');
       App.customerForms[key] = fullRec;
     }
     prevStatus = leadStatusOf(fullRec);
     setCF(fullRec, 'lead_status', 'Converted');
-    await postMessageWithResponse({ type: 'api-request', method: 'PUT', path: '/api4/customer-form/' + key, body: fullRec });
+    await unwrapWrite(await postMessageWithResponse({ type: 'api-request', method: 'PUT', path: customerFormPath, body: fullRec }),
+      { label: 'convert lead status update', path: customerFormPath });
   } catch (err) {
     console.error('[KEEL] convertLead step 1 failed', err);
     if (btn) clearLoading(btn, prevBtnHtml);
     logSync({
       ok: false, entity: 'Customer', action: 'Convert Lead (step 1/2)',
       error: String(err && err.message || err), payload: { customer: key },
-      req: { method: 'PUT', path: '/api4/customer-form/' + key, body: fullRec },
+      req: { method: 'PUT', path: customerFormPath, body: fullRec },
       retrySafe: true
     });
     showToast('Convert failed at step 1/2: ' + (err && err.message || err) + ' — lead unchanged', 'error');
     return;
   }
+  const ref = nextOppRef();
+  const quotePath = apiPath('/sales-quote-form');
+  const opp = {
+    Customer: key,
+    Reference: ref,
+    Description: '',
+    Lines: [],
+    CustomFields2: emptyCF()
+  };
+  setCF(opp, 'crm_state', 'Opportunity');
+  setCF(opp, 'pipeline_stage', 'Discovery');
   try {
-    const ref = nextOppRef();
-    const opp = {
-      Customer: key,
-      Reference: ref,
-      Description: '',
-      Lines: [],
-      CustomFields2: emptyCF()
-    };
-    setCF(opp, 'crm_state', 'Opportunity');
-    setCF(opp, 'pipeline_stage', 'Discovery');
-    const saved = await postMessageWithResponse({ type: 'api-request', method: 'POST', path: '/api4/sales-quote-form', body: opp });
+    const saved = unwrapWrite(await postMessageWithResponse({ type: 'api-request', method: 'POST', path: quotePath, body: opp }),
+      { label: 'create opportunity record', path: quotePath, requireKey: true });
     const oppKey = saved && (saved.Key || saved.key);
     if (oppKey) {
       opp.Key = oppKey;
@@ -1896,21 +1957,22 @@ async function convertLead(key, btn) {
     let rolledBack = false;
     try {
       setCF(fullRec, 'lead_status', prevStatus);
-      await postMessageWithResponse({ type: 'api-request', method: 'PUT', path: '/api4/customer-form/' + key, body: fullRec });
+      await unwrapWrite(await postMessageWithResponse({ type: 'api-request', method: 'PUT', path: customerFormPath, body: fullRec }),
+        { label: 'convert lead rollback', path: customerFormPath });
       rolledBack = true;
     } catch (rbErr) {
       console.error('[KEEL] convertLead rollback failed', rbErr);
       logSync({
         ok: false, entity: 'Customer', action: 'Convert Lead rollback',
         error: String(rbErr && rbErr.message || rbErr), payload: { customer: key, previousStatus: prevStatus },
-        req: { method: 'PUT', path: '/api4/customer-form/' + key, body: fullRec },
+        req: { method: 'PUT', path: customerFormPath, body: fullRec },
         retrySafe: false
       });
     }
     logSync({
       ok: false, entity: 'Opportunity', action: 'Convert Lead (step 2/2)',
       error: String(err && err.message || err), payload: { customer: key, rolledBack: rolledBack },
-      req: { method: 'POST', path: '/api4/sales-quote-form', body: opp },
+      req: { method: 'POST', path: quotePath, body: opp },
       retrySafe: false
     });
     if (rolledBack) {
@@ -1997,7 +2059,7 @@ async function openCustomer360(key) {
   App.cust360Tab = 'profile';
   if (!customerForm(key)) {
     try {
-      const rec = await postMessageWithResponse({ type: 'api-request', method: 'GET', path: '/api4/customer-form/' + key });
+      const rec = await getManagerRecord(apiPath('/customer-form/') + key, 'customer form');
       App.customerForms[key] = rec;
     } catch (err) {
       console.error('[KEEL] openCustomer360 load failed', err);
@@ -2101,7 +2163,9 @@ const PIPELINE_STAGES = ['Discovery', 'Meeting', 'Proposal', 'Client Feedback', 
 function stageOf(rec) { return getCF(rec, 'pipeline_stage') || 'Discovery'; }
 
 function putQuote(key, rec) {
-  return postMessageWithResponse({ type: 'api-request', method: 'PUT', path: '/api4/sales-quote-form/' + key, body: rec });
+  const path = apiPath('/sales-quote-form/') + key;
+  return postMessageWithResponse({ type: 'api-request', method: 'PUT', path: path, body: rec }).then((resp) =>
+    unwrapWrite(resp, { label: 'quote update', path: path }));
 }
 
 function replaceQuoteInCache(key, rec) {
@@ -2185,7 +2249,7 @@ async function openOpportunityDrawer(key) {
   let rec = App.quoteForms[key];
   if (!rec) {
     try {
-      rec = await postMessageWithResponse({ type: 'api-request', method: 'GET', path: '/api4/sales-quote-form/' + key });
+      rec = await getManagerRecord(apiPath('/sales-quote-form/') + key, 'opportunity record');
       replaceQuoteInCache(key, rec);
       renderOpportunitiesBoard();
     } catch (err) {
@@ -2254,7 +2318,7 @@ async function saveOpportunity(key, form, btn) {
     logSync({
       ok: false, entity: 'Opportunity', action: 'Update',
       error: String(err && err.message || err), payload: { key: key, stage: stage },
-      req: { method: 'PUT', path: '/api4/sales-quote-form/' + key, body: rec },
+      req: { method: 'PUT', path: apiPath('/sales-quote-form/') + key, body: rec },
       retrySafe: true
     });
     showToast('Stage change failed: ' + (err && err.message || err) + ' — reverted', 'error');
@@ -2286,7 +2350,7 @@ async function moveOpportunityStage(key, stage, btn) {
     logSync({
       ok: false, entity: 'Opportunity', action: 'Move Stage',
       error: String(err && err.message || err), payload: { key: key, from: prev, to: stage },
-      req: { method: 'PUT', path: '/api4/sales-quote-form/' + key, body: rec },
+      req: { method: 'PUT', path: apiPath('/sales-quote-form/') + key, body: rec },
       retrySafe: true
     });
     showToast('Stage change failed: ' + (err && err.message || err) + ' — reverted', 'error');
@@ -2316,7 +2380,7 @@ async function markOpportunityAsQuote(key, btn) {
     logSync({
       ok: false, entity: 'Quote', action: 'Mark as Quote',
       error: String(err && err.message || err), payload: { key: key },
-      req: { method: 'PUT', path: '/api4/sales-quote-form/' + key, body: rec },
+      req: { method: 'PUT', path: apiPath('/sales-quote-form/') + key, body: rec },
       retrySafe: true
     });
     showToast('Could not convert to quote: ' + (err && err.message || err) + ' — reverted', 'error');
@@ -2369,8 +2433,10 @@ async function createOpportunity(form, btn) {
   };
   setCF(opp, 'crm_state', 'Opportunity');
   setCF(opp, 'pipeline_stage', 'Discovery');
+  const quotePath = apiPath('/sales-quote-form');
   try {
-    const saved = await postMessageWithResponse({ type: 'api-request', method: 'POST', path: '/api4/sales-quote-form', body: opp });
+    const saved = unwrapWrite(await postMessageWithResponse({ type: 'api-request', method: 'POST', path: quotePath, body: opp }),
+      { label: 'create opportunity record', path: quotePath, requireKey: true });
     const oppKey = saved && (saved.Key || saved.key);
     if (oppKey) {
       opp.Key = oppKey;
@@ -2389,7 +2455,7 @@ async function createOpportunity(form, btn) {
     logSync({
       ok: false, entity: 'Opportunity', action: 'Create',
       error: String(err && err.message || err), payload: { customer: customer, reference: ref },
-      req: { method: 'POST', path: '/api4/sales-quote-form', body: opp },
+      req: { method: 'POST', path: quotePath, body: opp },
       retrySafe: false
     });
     showToast('Create failed: ' + (err && err.message || err), 'error');
@@ -2401,7 +2467,7 @@ async function createOpportunity(form, btn) {
 async function loadProducts() {
   if (App.productsLoaded && App.products.length) return App.products;
   return once('products', async () => {
-    App.products = await fetchManagerData('/api4/inventory-items');
+    App.products = await fetchManagerData(apiPath('/inventory-items'));
     App.productsLoaded = true;
     return App.products;
   });
@@ -2859,8 +2925,10 @@ async function saveNewQuote(form, btn) {
   };
   setCF(payload, 'crm_state', 'Draft Quote');
   setLoading(btn);
+  const quotePath = apiPath('/sales-quote-form');
   try {
-    const saved = await postMessageWithResponse({ type: 'api-request', method: 'POST', path: '/api4/sales-quote-form', body: payload });
+    const saved = unwrapWrite(await postMessageWithResponse({ type: 'api-request', method: 'POST', path: quotePath, body: payload }),
+      { label: 'create draft quote', path: quotePath, requireKey: true });
     const newKey = saved && (saved.Key || saved.key);
     logSync({ ok: true, entity: 'Quote', action: 'Create Quote', error: null, ref: reference, payload: { reference: reference, customer: customer, lines: lines.length } });
     logAudit('Create Quote', reference, { entity: 'Quote', reference: reference, result: 'ok' });
@@ -2881,7 +2949,7 @@ async function saveNewQuote(form, btn) {
     logSync({
       ok: false, entity: 'Quote', action: 'Create Quote',
       error: String(err && err.message || err), ref: reference, payload: payload,
-      req: { method: 'POST', path: '/api4/sales-quote-form', body: payload },
+      req: { method: 'POST', path: quotePath, body: payload },
       retrySafe: false
     });
     showToast('Quote save failed: ' + (err && err.message || err), 'error');
@@ -2907,7 +2975,7 @@ async function createQuoteRevision(key, btn) {
   let rec = App.quoteForms[key];
   if (!rec) {
     try {
-      rec = await postMessageWithResponse({ type: 'api-request', method: 'GET', path: '/api4/sales-quote-form/' + key });
+      rec = await getManagerRecord(apiPath('/sales-quote-form/') + key, 'quote form');
       App.quoteForms[key] = rec;
     } catch (err) {
       console.error('[KEEL] createQuoteRevision load failed', err);
@@ -2934,8 +3002,10 @@ async function createQuoteRevision(key, btn) {
   };
   setCF(clone, 'crm_state', 'Draft Quote');
   let newKey = null;
+  const quotePath = apiPath('/sales-quote-form');
   try {
-    const saved = await postMessageWithResponse({ type: 'api-request', method: 'POST', path: '/api4/sales-quote-form', body: clone });
+    const saved = unwrapWrite(await postMessageWithResponse({ type: 'api-request', method: 'POST', path: quotePath, body: clone }),
+      { label: 'create quote revision', path: quotePath, requireKey: true });
     newKey = saved && (saved.Key || saved.key);
     logSync({ ok: true, entity: 'Quote', action: 'Create Quote Revision (step 1/2)', error: null, ref: newRef, payload: { from: key, reference: newRef } });
   } catch (err) {
@@ -2943,7 +3013,7 @@ async function createQuoteRevision(key, btn) {
     logSync({
       ok: false, entity: 'Quote', action: 'Create Quote Revision (step 1/2)',
       error: String(err && err.message || err), payload: { from: key, reference: newRef },
-      req: { method: 'POST', path: '/api4/sales-quote-form', body: clone },
+      req: { method: 'POST', path: quotePath, body: clone },
       retrySafe: false
     });
     showToast('Revision failed at step 1/2: ' + (err && err.message || err) + ' — quote unchanged', 'error');
@@ -2959,7 +3029,7 @@ async function createQuoteRevision(key, btn) {
     logSync({
       ok: false, entity: 'Quote', action: 'Create Quote Revision (step 2/2)',
       error: String(err && err.message || err), payload: { superseded: key, newRef: newRef, newKey: newKey },
-      req: { method: 'PUT', path: '/api4/sales-quote-form/' + key, body: rec },
+      req: { method: 'PUT', path: apiPath('/sales-quote-form/') + key, body: rec },
       retrySafe: false
     });
     alert('Revision ' + newRef + ' was created, but the original quote ' + oldRef + ' could not be marked Superseded. Please retry the status change manually in Manager.io.');
@@ -3020,7 +3090,7 @@ async function approveQuote(key, btn) {
     logSync({
       ok: false, entity: 'Quote', action: 'Approve Quote',
       error: String(err && err.message || err), ref: ref, payload: { key: key },
-      req: { method: 'PUT', path: '/api4/sales-quote-form/' + key, body: rec },
+      req: { method: 'PUT', path: apiPath('/sales-quote-form/') + key, body: rec },
       retrySafe: true
     });
     showToast('Approve failed: ' + (err && err.message || err) + ' — quote unchanged', 'error');
@@ -3089,16 +3159,24 @@ async function convertQuoteToOrder(key, poNumber, masterRef, btn) {
   setCF(orderPayload, 'master_reference', masterRef);
   setLoading(btn);
   let orderKey = null;
+  const orderPath = apiPath('/sales-order-form');
+  const quotePath = apiPath('/sales-quote-form/') + key;
   try {
-    const saved = await postMessageWithResponse({ type: 'api-request', method: 'POST', path: '/api4/sales-order-form', body: orderPayload });
+    const saved = unwrapWrite(await postMessageWithResponse({ type: 'api-request', method: 'POST', path: orderPath, body: orderPayload }),
+      { label: 'create sales order', path: orderPath, requireKey: true });
     orderKey = saved && (saved.Key || saved.key);
+    if (orderKey) {
+      const orderRec = JSON.parse(JSON.stringify(orderPayload));
+      orderRec.Key = orderKey;
+      App.orderForms[orderKey] = orderRec;
+    }
     logSync({ ok: true, entity: 'SalesOrder', action: 'Convert Quote (step 1/2)', error: null, ref: poNumber, payload: { quote: key, masterRef: masterRef } });
   } catch (err) {
     console.error('[KEEL] convertQuoteToOrder step 1 failed', err);
     logSync({
       ok: false, entity: 'SalesOrder', action: 'Convert Quote (step 1/2)',
       error: String(err && err.message || err), ref: poNumber, payload: orderPayload,
-      req: { method: 'POST', path: '/api4/sales-order-form', body: orderPayload },
+      req: { method: 'POST', path: orderPath, body: orderPayload },
       retrySafe: false
     });
     showToast('Convert failed at step 1/2: ' + (err && err.message || err) + ' — no order was created', 'error');
@@ -3116,7 +3194,7 @@ async function convertQuoteToOrder(key, poNumber, masterRef, btn) {
     logSync({
       ok: false, entity: 'Quote', action: 'Convert Quote (step 2/2)',
       error: String(err && err.message || err), ref: ref, payload: { key: key, orderKey: orderKey, masterRef: masterRef },
-      req: { method: 'PUT', path: '/api4/sales-quote-form/' + key, body: rec },
+      req: { method: 'PUT', path: quotePath, body: rec },
       retrySafe: false
     });
     alert('Order created (' + poNumber + ' / ' + masterRef + ') but quote status not updated — retry the conversion once the order is verified.');
@@ -3205,7 +3283,7 @@ async function openOrderViewDrawer(key) {
   let form = App.orderForms[key];
   if (!form) {
     try {
-      form = await postMessageWithResponse({ type: 'api-request', method: 'GET', path: '/api4/sales-order-form/' + key });
+      form = await getManagerRecord(apiPath('/sales-order-form/') + key, 'sales order form');
       App.orderForms[key] = form;
     } catch (err) {
       console.error('[KEEL] openOrderViewDrawer load failed', err);
@@ -3767,7 +3845,7 @@ async function openProductionDrawer(key) {
   let form = App.orderForms[key];
   if (!form) {
     try {
-      form = await postMessageWithResponse({ type: 'api-request', method: 'GET', path: '/api4/sales-order-form/' + key });
+      form = await getManagerRecord(apiPath('/sales-order-form/') + key, 'sales order form');
       App.orderForms[key] = form;
     } catch (err) {
       console.error('[KEEL] openProductionDrawer load failed', err);
@@ -3783,8 +3861,10 @@ async function persistProductionState(orderKey, state, prevRaw, actionName, deta
   const form = App.orderForms[orderKey];
   if (!form) return false;
   setCF(form, 'production_state', serializeProductionState(state));
+  const orderFormPath = apiPath('/sales-order-form/') + orderKey;
   try {
-    await postMessageWithResponse({ type: 'api-request', method: 'PUT', path: '/api4/sales-order-form/' + orderKey, body: form });
+    await unwrapWrite(await postMessageWithResponse({ type: 'api-request', method: 'PUT', path: orderFormPath, body: form }),
+      { label: 'persist production state', path: orderFormPath });
     App.orderForms[orderKey] = form;
     App.productionState[orderKey] = parseProductionState(form, orderKey);
     logSync({ ok: true, entity: 'SalesOrder', action: actionName, error: null, ref: form.Reference || orderKey, payload: detail || null });
@@ -3803,7 +3883,7 @@ async function persistProductionState(orderKey, state, prevRaw, actionName, deta
       ok: false, entity: 'SalesOrder', action: actionName,
       error: String(err && err.message || err), ref: form.Reference || orderKey,
       payload: Object.assign({ orderKey: orderKey }, detail || {}),
-      req: { method: 'PUT', path: '/api4/sales-order-form/' + orderKey, body: form },
+      req: { method: 'PUT', path: orderFormPath, body: form },
       retrySafe: true
     });
     showToast(actionName + ' failed: ' + (err && err.message || err) + ' — reverted', 'error');
@@ -4130,12 +4210,34 @@ function syncFailureRows() {
     .reverse();
 }
 
+/* Stale /api4 paths from a previous session must never break retry — normalize on the way out. */
+function normalizeLegacyPath(path) {
+  return String(path || '').replace(/^\/api4(?=\/|$)/, API_PREFIX);
+}
+
+function syncTabBarHtml() {
+  if (!can('view_audit')) return '';
+  const active = App.syncTab === 'diagnostics' ? 'diagnostics' : 'failures';
+  const mk = (id, label) => '<button type="button" data-sync-tab="' + id + '" class="rounded-[4px] px-3 py-1.5 text-xs font-medium transition '
+    + (active === id ? 'accln actbg accent' : 'sec btnhov') + '">' + escapeHtml(label) + '</button>';
+  return '<div class="mb-4 flex flex-wrap gap-2">' + mk('failures', 'Failed Operations') + mk('diagnostics', 'Diagnostics') + '</div>';
+}
+
 function renderSyncCenter() {
   const host = document.getElementById('sync-body');
   if (!host) return;
+  if (App.syncTab === 'diagnostics') {
+    if (!can('view_audit')) {
+      App.syncTab = 'failures';
+    } else {
+      renderSyncDiagnostics(host);
+      return;
+    }
+  }
   const rows = syncFailureRows();
   if (!rows.length) {
-    host.innerHTML = '<div class="flex flex-col items-center justify-center px-6 py-14 text-center">'
+    host.innerHTML = syncTabBarHtml()
+      + '<div class="flex flex-col items-center justify-center px-6 py-14 text-center">'
       + '<svg class="h-8 w-8 okfg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>'
       + '<p class="mt-3 text-sm font-medium t">No failed operations — all synced cleanly.</p>'
       + '<p class="mt-1 max-w-sm text-xs muted">Failed gateway calls appear here with retry and payload inspection.</p>'
@@ -4171,7 +4273,8 @@ function renderSyncCenter() {
       + '<pre class="x-scroll max-h-56 overflow-auto whitespace-pre-wrap break-all rounded-[4px] border line thead p-3 text-[11px] leading-relaxed sec">'
       + escapeHtml(JSON.stringify(raw, null, 2)) + '</pre></td></tr>';
   }).join('');
-  host.innerHTML = '<div class="x-scroll"><table class="w-full min-w-[900px] text-sm">'
+  host.innerHTML = syncTabBarHtml()
+    + '<div class="x-scroll"><table class="w-full min-w-[900px] text-sm">'
     + '<thead class="thead">' + headHtml + '</thead>'
     + '<tbody>' + rowsHtml + '</tbody></table></div>'
     + '<div class="border-t line px-4 py-2 text-[11px] muted">' + rows.length + ' failed operation'
@@ -4186,12 +4289,18 @@ async function retrySyncEntry(idx, btn) {
   }
   setLoading(btn);
   try {
-    await postMessageWithResponse({
+    const normalized = normalizeLegacyPath(entry.req.path);
+    await unwrapWrite(await postMessageWithResponse({
       type: 'api-request',
       method: entry.req.method,
-      path: entry.req.path,
+      path: normalized,
       body: entry.req.body
+    }), {
+      label: 'retry of ' + (entry.action || 'operation'),
+      path: normalized,
+      requireKey: String(entry.req.method).toUpperCase() === 'POST'
     });
+    logSync({ ok: true, entity: entry.entity || '', action: (entry.action || 'operation') + ' (retry)', error: null, ref: entry.ref || null });
     App.syncLog.splice(idx, 1);
     logAudit('Sync Retry', (entry.action || 'operation') + (entry.ref ? ' · ' + entry.ref : ''),
       { entity: entry.entity || '', reference: entry.ref || '', result: 'ok' });
@@ -4203,6 +4312,184 @@ async function retrySyncEntry(idx, btn) {
     showToast('Retry failed: ' + (err && err.message || err), 'error');
   }
   renderSyncCenter();
+}
+
+/* ═══ 14C2. SYNC CENTER — BRIDGE DIAGNOSTICS PANEL (Admin/GM only) ═══ */
+/* Legacy prefix constant is intentional and exists ONLY for the diagnostics legacy probe —
+   no functional request in this app may use it (see the API_PREFIX section at the top). */
+const LEGACY_API_PREFIX = '/api4';
+const SYNC_DIAG_PREVIEW_LEN = 400;
+
+const SYNC_DIAG_META = {
+  'read-api2': {
+    label: 'Read test: /api2/customers (PageSize=1)',
+    hint: 'Expect items and totalRecords — this is the working prefix used by the app.'
+  },
+  'read-noprefix': {
+    label: 'Read test: /customers (no prefix)',
+    hint: 'Alternate candidate — confirms whether the bridge adds the prefix itself.'
+  },
+  'read-api4': {
+    label: 'Read test: ' + LEGACY_API_PREFIX + '/customers (legacy)',
+    hint: 'Expected to fail — the exact 404 body is shown so there is no doubt.'
+  },
+  'write-probe': {
+    label: 'Write probe: create + delete (self-cleaning)',
+    hint: 'Creates and immediately deletes a temporary record (Code ZZ-PROBE). Shows both responses.'
+  }
+};
+
+function syncDiagPreview(body) {
+  let json = '';
+  try { json = JSON.stringify(body, null, 2) || ''; } catch (e) { json = String(body); }
+  const truncated = json.length > SYNC_DIAG_PREVIEW_LEN;
+  return JSON.stringify({
+    truncated: truncated,
+    preview: truncated ? json.slice(0, SYNC_DIAG_PREVIEW_LEN) + ' …' : json
+  }, null, 2);
+}
+
+function syncDiagRecordSummary(body) {
+  if (!body || typeof body !== 'object') return '';
+  const total = Number(body.totalRecords);
+  if (Number.isFinite(total) && total > 0) return total + ' records (totalRecords)';
+  if (Number.isFinite(total)) return String(total) + ' records';
+  const items = Array.isArray(body) ? body : (body.items || body.data || body.rows || []);
+  if (Array.isArray(items)) return items.length + ' item' + (items.length === 1 ? '' : 's') + ' in probe response';
+  return '';
+}
+
+function syncDiagVerdictChip(status, ok, expectFail) {
+  if (status === 'running') return '<span class="rounded-full badge-warn px-2 py-0.5 text-[11px] warnfg">running…</span>';
+  if (status === 'ok' && ok) return '<span class="rounded-full badge-ok px-2 py-0.5 text-[11px] okfg">OK</span>';
+  if (expectFail) return '<span class="rounded-full badge-err px-2 py-0.5 text-[11px] errfg">failed (expected — legacy prefix)</span>';
+  return '<span class="rounded-full badge-err px-2 py-0.5 text-[11px] errfg">FAILED</span>';
+}
+
+function syncDiagnosticWorkingSummary() {
+  const r = App.syncDiag.results;
+  const a2 = r['read-api2'];
+  const nopfx = r['read-noprefix'];
+  const a2Ok = a2 && a2.status === 'ok' && a2.ok;
+  const nopfxOk = nopfx && nopfx.status === 'ok' && nopfx.ok;
+  if (a2Ok) {
+    return 'Working prefix: /api2' + (a2.summary ? ' — ' + a2.summary : '');
+  }
+  if (!nopfxOk) {
+    return 'No prefix works — check business selection / permissions.';
+  }
+  return 'Working prefix: none needed — /customers responded directly.';
+}
+
+async function runSyncDiagnosticRequest(kind) {
+  if (kind === 'read-api2' || kind === 'read-noprefix' || kind === 'read-api4') {
+    const path = kind === 'read-api2'
+      ? apiPath('/customers') + '?PageSize=1'
+      : kind === 'read-noprefix'
+        ? '/customers?PageSize=1'
+        : LEGACY_API_PREFIX + '/customers?PageSize=1';
+    const body = await postMessageWithResponse({ type: 'api-request', method: 'GET', path: path });
+    const errText = managerErrorText(body);
+    if (errText) {
+      return { ok: false, status: 'fail', error: errText, raw: syncDiagPreview(body), summary: '' };
+    }
+    return { ok: true, status: 'ok', error: null, raw: syncDiagPreview(body), summary: syncDiagRecordSummary(body) };
+  }
+  if (kind === 'write-probe') {
+    const createPath = apiPath('/customer-form');
+    const probePayload = { Name: 'KEEL BRIDGE PROBE', Code: 'ZZ-PROBE', CustomFields2: emptyCF() };
+    let createRaw = '';
+    let createdKey = null;
+    let created = null;
+    let createErr = null;
+    try {
+      created = unwrapWrite(await postMessageWithResponse({ type: 'api-request', method: 'POST', path: createPath, body: probePayload }),
+        { label: 'diagnostics write probe (create)', path: createPath, requireKey: true });
+      createdKey = created && (created.Key || created.key || created.id || created.Id) || null;
+      createRaw = syncDiagPreview(created);
+    } catch (e) {
+      createErr = String(e && e.message || e);
+    }
+    let deleteRaw = '';
+    let deleteErr = null;
+    let deletedOk = null;
+    if (createdKey) {
+      try {
+        const delResp = await postMessageWithResponse({ type: 'api-request', method: 'DELETE', path: createPath + '/' + createdKey });
+        deleteRaw = syncDiagPreview(delResp);
+        deletedOk = !managerErrorText(delResp);
+      } catch (e) {
+        deleteErr = String(e && e.message || e);
+      }
+    }
+    const ok = !!createdKey && deletedOk === true;
+    const summary = ok
+      ? 'Probe record created (Key captured) and deleted — write path verified.'
+      : (createErr
+        ? 'Create probe failed: ' + createErr
+        : (deleteErr ? 'Probe created but delete failed: ' + deleteErr : 'Probe outcome ambiguous — check the responses.'));
+    return { ok: ok, status: ok ? 'ok' : 'fail', error: createErr || deleteErr, raw: createRaw + (deleteRaw ? '\n\n— DELETE response —\n' + deleteRaw : ''), summary: summary };
+  }
+  return { ok: false, status: 'fail', error: 'Unknown diagnostic kind', raw: '', summary: '' };
+}
+
+async function runSyncDiagnostic(kind) {
+  if (!can('view_audit')) {
+    showToast('Diagnostics is available to Admin/GM only', 'error');
+    return;
+  }
+  const meta = SYNC_DIAG_META[kind];
+  if (!meta) return;
+  const existing = App.syncDiag.results[kind];
+  if (existing && existing.status === 'running') return;
+  App.syncDiag.results[kind] = { status: 'running' };
+  renderSyncCenter();
+  try {
+    const result = await runSyncDiagnosticRequest(kind);
+    App.syncDiag.results[kind] = result;
+  } catch (err) {
+    console.error('[KEEL] diagnostic ' + kind + ' failed', err);
+    App.syncDiag.results[kind] = { status: 'fail', ok: false, error: String(err && err.message || err), raw: '', summary: '' };
+  }
+  if (App.currentView === 'sync') renderSyncCenter();
+}
+
+function renderSyncDiagnostics(host) {
+  const order = ['read-api2', 'read-noprefix', 'read-api4', 'write-probe'];
+  const cards = order.map((kind) => {
+    const meta = SYNC_DIAG_META[kind];
+    const r = App.syncDiag.results[kind] || null;
+    const expectFail = kind === 'read-api4';
+    const btnLbl = (r && r.status === 'running') ? 'Running…' : 'Run';
+    const btn = '<button type="button" data-sync-diag="' + kind + '" class="rounded-[4px] border line px-3 py-1.5 text-xs font-medium sec transition btnhov"'
+      + ((r && r.status === 'running') ? ' disabled' : '') + '>' + btnLbl + '</button>';
+    let bodyHtml;
+    if (!r) {
+      bodyHtml = '<p class="text-xs muted">Not run yet.</p>';
+    } else if (r.status === 'running') {
+      bodyHtml = '<div class="flex items-center gap-2 text-xs muted"><span class="spinner"></span> Request in flight…</div>';
+    } else {
+      bodyHtml = (r.summary ? '<div class="mb-1 text-xs font-medium t">' + escapeHtml(r.summary) + '</div>' : '')
+        + (r.error ? '<div class="mb-1 break-all text-[11.5px] errfg">error: ' + escapeHtml(r.error) + '</div>' : '')
+        + (r.raw
+          ? '<pre class="x-scroll max-h-48 overflow-auto whitespace-pre-wrap break-all rounded-[4px] border line thead p-3 text-[11px] leading-relaxed sec">'
+            + escapeHtml(r.raw) + '</pre>'
+          : '');
+    }
+    return '<div class="rounded-[4px] border line thead p-4">'
+      + '<div class="mb-1 flex flex-wrap items-center gap-2">'
+      + '<span class="text-[12.5px] font-semibold t">' + escapeHtml(meta.label) + '</span>'
+      + (r ? syncDiagVerdictChip(r.status, r.ok, expectFail) : '')
+      + '<span class="ml-auto">' + btn + '</span></div>'
+      + '<p class="mb-2 text-[11.5px] muted">' + escapeHtml(meta.hint) + '</p>'
+      + bodyHtml
+      + '</div>';
+  }).join('');
+  host.innerHTML = syncTabBarHtml()
+    + '<p class="mb-3 text-[11.5px] muted">Runs one real request through the Manager.io message bridge from inside this app. '
+    + 'The write probe ' + escapeHtml(SYNC_DIAG_META['write-probe'].hint) + '</p>'
+    + '<div class="mb-4 rounded-[4px] border line soft p-3 text-[12.5px] font-semibold t">' + escapeHtml(syncDiagnosticWorkingSummary()) + '</div>'
+    + '<div class="space-y-3">' + cards + '</div>';
 }
 
 /* ═══ 14D. CATALOG VIEW ═══ */
@@ -4432,6 +4719,21 @@ document.getElementById('view-settings').addEventListener('click', (event) => {
 });
 
 document.getElementById('view-sync').addEventListener('click', (event) => {
+  const tabBtn = event.target.closest('[data-sync-tab]');
+  if (tabBtn) {
+    App.syncTab = tabBtn.getAttribute('data-sync-tab');
+    if (App.syncTab === 'diagnostics' && !can('view_audit')) {
+      showToast('Diagnostics is available to Admin/GM only', 'error');
+      App.syncTab = 'failures';
+    }
+    renderSyncCenter();
+    return;
+  }
+  const diagBtn = event.target.closest('[data-sync-diag]');
+  if (diagBtn && !diagBtn.disabled) {
+    runSyncDiagnostic(diagBtn.getAttribute('data-sync-diag'));
+    return;
+  }
   const toggle = event.target.closest('[data-sync-toggle]');
   if (toggle) {
     const idx = toggle.getAttribute('data-sync-toggle');
