@@ -1018,6 +1018,9 @@ function unwrapWrite(resp, opts) {
 }
 
 function unwrapRead(resp, label) {
+  if (resp === null || resp === undefined) {
+    throw new Error('No response from Manager.io for the ' + (label || 'read') + ' — the request did not complete.');
+  }
   const errText = managerErrorText(resp);
   if (errText) throw new Error('Manager error (' + (label || 'read') + '): ' + errText);
   return resp;
@@ -1035,16 +1038,34 @@ async function fetchManagerData(endpoint) {
   let pageNum = 0;
 
   do {
-    const path = nextToken
-      ? `${endpoint}?PageSize=99999&next_page_token=` + encodeURIComponent(nextToken)
-      : `${endpoint}?PageSize=99999`;
+    const path = nextToken === '__skip__'
+      ? `${endpoint}?PageSize=99999&Skip=` + allItems.length
+      : nextToken
+        ? `${endpoint}?PageSize=99999&next_page_token=` + encodeURIComponent(nextToken)
+        : `${endpoint}?PageSize=99999`;
 
     const data = await postMessageWithResponse({ type: 'api-request', method: 'GET', path });
-    unwrapRead(data, 'GET ' + path);
-    const page = Array.isArray(data) ? data : (data.items || data.data || []);
+    const label = 'GET ' + path;
+    if (!data) throw new Error('No response from Manager.io for the ' + label + ' read — the endpoint may not exist.');
+    unwrapRead(data, label);
+
+    let page = Array.isArray(data) ? data : (data.items || data.data || data.rows);
+    if (!Array.isArray(page) && data && typeof data === 'object') {
+      page = Object.keys(data).map((k) => data[k]).find((v) => Array.isArray(v));
+    }
+    if (!Array.isArray(page)) page = [];
 
     allItems.push(...page);
-    nextToken = data.next_page_token || data.nextPageToken || data._links?.next?.href || null;
+
+    const totalRecords = Number(data.totalRecords);
+    const serverToken = data.next_page_token || data.nextPageToken || data._links?.next?.href || null;
+    if (serverToken) {
+      nextToken = serverToken;
+    } else if (page.length && Number.isFinite(totalRecords) && totalRecords > allItems.length) {
+      nextToken = '__skip__';
+    } else {
+      nextToken = null;
+    }
 
     pageNum++;
     if (pageNum >= 1000) break;
@@ -1569,7 +1590,7 @@ function once(name, fn) {
 }
 
 async function loadCustomers() {
-  App.customers = await fetchManagerData(apiPath('/customer'));
+  App.customers = await fetchManagerData(apiPath('/customers'));
   return App.customers;
 }
 
@@ -1599,7 +1620,7 @@ function surfaceHydrationFailures(results, label) {
 }
 
 async function loadQuotes() {
-  App.quotesRaw = await fetchManagerData(apiPath('/sales-quote'));
+  App.quotesRaw = await fetchManagerData(apiPath('/sales-quotes'));
   return App.quotesRaw;
 }
 
@@ -1629,26 +1650,13 @@ async function loadQuoteData() {
 
 async function loadOrders() {
   const listPath = apiPath('/sales-orders');
-  const altPath = apiPath('/sales-order');
   let rows = [];
-  let primaryFailed = null;
   try {
     rows = await fetchManagerData(listPath);
   } catch (err) {
-    primaryFailed = err;
     console.error('[KEEL] loadOrders ' + listPath + ' failed', err);
+    throw err;
   }
-  let altOk = false;
-  if (!rows.length) {
-    try {
-      const alt = await fetchManagerData(altPath);
-      altOk = true;
-      if (alt.length) rows = alt;
-    } catch (err) {
-      console.error('[KEEL] loadOrders ' + altPath + ' failed', err);
-    }
-  }
-  if (!rows.length && primaryFailed && !altOk) throw primaryFailed;
   App.orders = rows;
   return App.orders;
 }
