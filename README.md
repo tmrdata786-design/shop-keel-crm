@@ -168,6 +168,7 @@ stages advanced, QC signed off — with who did it and when. You can export the 
   orders.
 - **Wrong role?** Switch it in the header; the screens update instantly to show the right
   permissions.
+- **Dark or light?** Toggle the theme from the header; your choice is remembered on this device.
 
 ---
 
